@@ -25,20 +25,16 @@ Each decision is appended to `~/.local/state/opencode/auto-mode.jsonl`.
 
 ## Install
 
-Requires OpenCode **2.0.21+** (the V2 plugin API). Clone the repo and point OpenCode at the directory:
-
-```sh
-git clone https://github.com/aSempruch/opencode-auto-mode ~/opencode-auto-mode
-```
+Requires OpenCode **2.0.21+** (the V2 plugin API). Add it to your config and restart OpenCode (`opencode service restart` if you use the background service):
 
 ```jsonc
 // ~/.config/opencode/opencode.jsonc
 {
-  "plugins": ["/absolute/path/to/opencode-auto-mode"]
+  "plugins": ["github:aSempruch/opencode-auto-mode"]
 }
 ```
 
-Or drop the clone (or a symlink) into `~/.config/opencode/plugins/` or `.opencode/plugins/`, which OpenCode loads automatically. Nothing needs installing at runtime: the plugin has no runtime dependencies.
+OpenCode installs it from GitHub on startup. To hack on it, clone the repo and use the absolute path instead (`"plugins": ["/path/to/opencode-auto-mode"]`), or symlink the clone into `~/.config/opencode/plugins/`. The plugin has no runtime dependencies.
 
 ## Options
 
@@ -46,7 +42,7 @@ Or drop the clone (or a symlink) into `~/.config/opencode/plugins/` or `.opencod
 {
   "plugins": [
     {
-      "package": "/absolute/path/to/opencode-auto-mode",
+      "package": "github:aSempruch/opencode-auto-mode",
       "options": {
         "review": ["shell"],         // also review these actions when rules allow them ("*" = everything)
         "skip": ["question"],        // never review these actions
