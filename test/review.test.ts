@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test"
 import {
   buildPrompt,
   selectTurns,
+  decideOutcome,
   defaults,
   isReadOnlyShell,
   parseVerdict,
@@ -176,5 +177,43 @@ describe("selectTurns", () => {
 
   test("pinning can be disabled", () => {
     expect(selectTurns(turns, 8, false).task).toBeUndefined()
+  })
+})
+
+describe("decideOutcome", () => {
+  const base = { onBlock: "deny" as const, onError: "ask" as const, escalation: "deny" as const, maxConsecutiveBlocks: 3 }
+
+  test("allow passes through", () => {
+    expect(decideOutcome({ decision: "allow", reason: "" }, 0, base)).toEqual({ effect: "allow" })
+  })
+
+  test("block denies with the reason", () => {
+    const outcome = decideOutcome({ decision: "block", reason: "exfiltration" }, 1, base)
+    expect(outcome.effect).toBe("deny")
+    expect(outcome.message).toContain("exfiltration")
+  })
+
+  test("escalations deny and ask for conversational confirmation by default", () => {
+    for (const outcome of [
+      decideOutcome({ decision: "ask", reason: "unclear" }, 0, base),
+      decideOutcome(undefined, 0, base),
+      decideOutcome({ decision: "block", reason: "x" }, 3, base),
+    ]) {
+      expect(outcome.effect).toBe("deny")
+      expect(outcome.message).toContain("confirm this exact action in the conversation")
+    }
+  })
+
+  test("escalation: ask restores native prompts", () => {
+    const ask = { ...base, escalation: "ask" as const }
+    expect(decideOutcome({ decision: "ask", reason: "unclear" }, 0, ask).effect).toBe("ask")
+    expect(decideOutcome(undefined, 0, ask).effect).toBe("ask")
+    expect(decideOutcome({ decision: "block", reason: "x" }, 3, ask).effect).toBe("ask")
+    expect(decideOutcome({ decision: "block", reason: "x" }, 1, ask).effect).toBe("deny")
+  })
+
+  test("onError allow and deny are honored", () => {
+    expect(decideOutcome(undefined, 0, { ...base, onError: "allow" })).toEqual({ effect: "allow", message: undefined })
+    expect(decideOutcome(undefined, 0, { ...base, onError: "deny" }).effect).toBe("deny")
   })
 })

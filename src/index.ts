@@ -15,6 +15,7 @@ import {
 } from "./context.ts"
 import {
   buildPrompt,
+  decideOutcome,
   isReadOnlyShell,
   parseVerdict,
   renderAction,
@@ -216,57 +217,55 @@ const plugin: Plugin.Plugin = {
       }
 
       // Same route OpenCode uses for chat: the server resolves provider, credentials and options for this model.
-      const signal = options.timeoutMs ? AbortSignal.timeout(options.timeoutMs) : undefined
-      const generate = () => ctx.generate.text({ prompt, ...(model ? { model } : {}) }, { signal })
+      // The in-process client does not reliably honor abort signals, so the deadline is enforced with a race.
+      const controller = new AbortController()
+      const deadline = options.timeoutMs ? Date.now() + options.timeoutMs : Infinity
+      const generate = () => {
+        const call = ctx.generate.text({ prompt, ...(model ? { model } : {}) }, { signal: controller.signal })
+        if (deadline === Infinity) return call
+        let timer: ReturnType<typeof setTimeout> | undefined
+        const expired = new Promise<never>((_, reject) => {
+          timer = setTimeout(() => {
+            controller.abort()
+            reject(new Error(`timed out after ${options.timeoutMs}ms`))
+          }, Math.max(0, deadline - Date.now()))
+        })
+        return Promise.race([call, expired]).finally(() => clearTimeout(timer))
+      }
       let text: string
       try {
         text = (
           await generate().catch(async (error) => {
-            if (signal?.aborted) throw error
+            if (controller.signal.aborted) throw error
             await new Promise((resolve) => setTimeout(resolve, 1000))
             return generate()
           })
         ).text
       } catch (error) {
-        return decide(options.onError, `Auto-mode reviewer failed: ${String(error)}`, "error", { model, ...shape })
+        const outcome = decideOutcome(undefined, 0, options, `Auto-mode reviewer failed: ${String(error)}`)
+        return decide(outcome.effect, outcome.message, "error", { model, ...shape })
       }
 
       const verdict = parseVerdict(text)
       if (!verdict) {
-        return decide(options.onError, "Auto-mode reviewer gave no clear verdict.", "unparseable", {
-          model,
-          ...shape,
-          reply: text.slice(0, 500),
-        })
+        const outcome = decideOutcome(undefined, 0, options)
+        return decide(outcome.effect, outcome.message, "unparseable", { model, ...shape, reply: text.slice(0, 500) })
       }
 
-      if (verdict.decision === "allow") {
+      const streak = verdict.decision === "block" ? (streaks.get(event.sessionID) ?? 0) + 1 : 0
+      const outcome = decideOutcome(verdict, streak, options)
+      if (verdict.decision === "allow") allowed.set(cacheKey, Date.now())
+      // A streak ends on any non-block verdict, and once it has escalated.
+      if (verdict.decision !== "block" || (options.maxConsecutiveBlocks > 0 && streak >= options.maxConsecutiveBlocks))
         streaks.delete(event.sessionID)
-        allowed.set(cacheKey, Date.now())
-        return decide("allow", undefined, "model", { model, ...shape, reason: verdict.reason })
-      }
-
-      if (verdict.decision === "ask") {
-        return decide("ask", `Auto-mode is unsure: ${verdict.reason || "no reason given"}`, "model", {
-          model,
-          ...shape,
-          reason: verdict.reason,
-        })
-      }
-
-      const streak = (streaks.get(event.sessionID) ?? 0) + 1
-      streaks.set(event.sessionID, streak)
-      const reason = verdict.reason || "no reason given"
-      if (options.onBlock === "ask" || (options.maxConsecutiveBlocks > 0 && streak >= options.maxConsecutiveBlocks)) {
-        if (options.onBlock !== "ask") streaks.delete(event.sessionID)
-        return decide("ask", `Auto-mode flagged this: ${reason}`, "model", { model, ...shape, reason, streak })
-      }
-      return decide(
-        "deny",
-        `Blocked by auto-mode safety review: ${reason} Choose a safer approach, or ask the user to run or approve it explicitly.`,
-        "model",
-        { model, ...shape, reason, streak },
-      )
+      else streaks.set(event.sessionID, streak)
+      return decide(outcome.effect, outcome.message, "model", {
+        model,
+        ...shape,
+        verdict: verdict.decision,
+        reason: verdict.reason,
+        ...(streak ? { streak } : {}),
+      })
     })
 
     return () => {

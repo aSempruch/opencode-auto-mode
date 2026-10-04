@@ -17,10 +17,17 @@ export interface Options {
   agentContextChars: number
   /** How many recent tool calls in the session to include. 0 disables. */
   toolCalls: number
-  /** What a "block" verdict becomes: deny (agent sees the reason) or ask (escalate to you). */
+  /** What a "block" verdict becomes: deny (agent sees the reason) or escalate. */
   onBlock: "deny" | "ask"
-  /** What happens when the reviewer fails, times out or returns something unparseable. */
+  /** What happens when the reviewer fails, times out or returns something unparseable. "ask" means escalate. */
   onError: Effect
+  /**
+   * How escalations (unsure verdicts, reviewer failures, block streaks) reach you. "deny" (default) refuses the
+   * action and tells the agent to get your confirmation in the conversation, which the next review honors; this
+   * stays safe in unattended runs such as \`opencode run --dangerously-skip-permissions\`, where a native prompt
+   * would be auto-approved. "ask" shows OpenCode's native permission prompt instead.
+   */
+  escalation: "deny" | "ask"
   /** After this many consecutive blocks in a session, escalate to ask instead of denying. 0 disables. */
   maxConsecutiveBlocks: number
   /** Allow obviously read-only shell commands without calling the model. */
@@ -46,6 +53,7 @@ export const defaults: Options = {
   toolCalls: 6,
   onBlock: "deny",
   onError: "ask",
+  escalation: "deny",
   maxConsecutiveBlocks: 3,
   fastAllow: true,
   timeoutMs: 180_000,
@@ -71,6 +79,7 @@ export function resolveOptions(input: Readonly<Record<string, unknown>> | undefi
     toolCalls: int(raw.toolCalls, defaults.toolCalls),
     onBlock: raw.onBlock === "ask" ? "ask" : "deny",
     onError: typeof raw.onError === "string" && effects.has(raw.onError) ? (raw.onError as Effect) : defaults.onError,
+    escalation: raw.escalation === "ask" ? "ask" : "deny",
     maxConsecutiveBlocks: int(raw.maxConsecutiveBlocks, defaults.maxConsecutiveBlocks),
     fastAllow: typeof raw.fastAllow === "boolean" ? raw.fastAllow : defaults.fastAllow,
     variant: typeof raw.variant === "string" && raw.variant ? raw.variant : undefined,
@@ -238,6 +247,46 @@ ${input.action}
 
 Reply with exactly one line of JSON and nothing else:
 {"decision": "allow" | "block" | "ask", "reason": "<one short sentence>"}`
+}
+
+export interface Outcome {
+  effect: Effect
+  message?: string
+}
+
+const CONFIRM =
+  "Ask the user to confirm this exact action in the conversation before retrying; their explicit confirmation will be honored."
+
+/** Deliver an escalation per `options.escalation`. */
+export function escalate(note: string, options: Pick<Options, "escalation">): Outcome {
+  return options.escalation === "ask"
+    ? { effect: "ask", message: note }
+    : { effect: "deny", message: `${note} ${CONFIRM}` }
+}
+
+/**
+ * Map a reviewer result to a permission outcome. `verdict` undefined means the reviewer failed or was unparseable.
+ * `streak` is the number of consecutive blocks in the session including this one.
+ */
+export function decideOutcome(
+  verdict: Verdict | undefined,
+  streak: number,
+  options: Pick<Options, "onBlock" | "onError" | "escalation" | "maxConsecutiveBlocks">,
+  failure = "Auto-mode reviewer gave no clear verdict.",
+): Outcome {
+  if (!verdict) {
+    if (options.onError === "ask") return escalate(failure, options)
+    return { effect: options.onError, message: options.onError === "allow" ? undefined : failure }
+  }
+  if (verdict.decision === "allow") return { effect: "allow" }
+  const reason = verdict.reason || "no reason given"
+  if (verdict.decision === "ask") return escalate(`Auto-mode is unsure: ${reason}`, options)
+  if (options.onBlock === "ask" || (options.maxConsecutiveBlocks > 0 && streak >= options.maxConsecutiveBlocks))
+    return escalate(`Auto-mode flagged this: ${reason}`, options)
+  return {
+    effect: "deny",
+    message: `Blocked by auto-mode safety review: ${reason} Choose a safer approach, or ask the user to run or approve it explicitly.`,
+  }
 }
 
 export interface Verdict {
