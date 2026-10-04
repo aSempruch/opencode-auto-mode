@@ -1,6 +1,6 @@
 {
   "name": "opencode-auto-mode",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Claude Code style auto mode for OpenCode 2: the session's own model reviews risky tool calls before they run.",
   "type": "module",
   "license": "MIT",
