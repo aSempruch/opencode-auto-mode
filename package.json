@@ -1,0 +1,32 @@
+{
+  "name": "opencode-auto-mode",
+  "version": "0.1.0",
+  "description": "Claude Code style auto mode for OpenCode 2: the session's own model reviews risky tool calls before they run.",
+  "type": "module",
+  "license": "MIT",
+  "exports": {
+    ".": "./index.ts"
+  },
+  "files": [
+    "src",
+    "index.ts"
+  ],
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "permissions",
+    "auto-mode"
+  ],
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  },
+  "peerDependencies": {
+    "@opencode/plugin": ">=2.0.21"
+  },
+  "devDependencies": {
+    "@opencode/plugin": "2.0.22",
+    "@types/bun": "latest",
+    "typescript": "^5.9.0"
+  }
+}
