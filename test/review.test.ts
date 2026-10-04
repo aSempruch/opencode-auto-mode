@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test"
 import {
   buildPrompt,
+  selectTurns,
   defaults,
   isReadOnlyShell,
   parseVerdict,
@@ -112,7 +113,7 @@ describe("prompt", () => {
       { action: "shell", resources: ["npm test"], tool: "shell", input: { command: "npm test" }, directory: "/repo" },
       1000,
     )
-    const prompt = buildPrompt({ userMessages: ["fix the failing test"], action })
+    const prompt = buildPrompt({ turns: [{ kind: "user", id: "1", text: "fix the failing test" }], action })
     expect(prompt).toContain("fix the failing test")
     expect(prompt).toContain("Working directory: /repo")
     expect(prompt).toContain('"command": "npm test"')
@@ -128,5 +129,52 @@ describe("prompt", () => {
 describe("ask verdict", () => {
   test("parses ask", () => {
     expect(parseVerdict('{"decision":"ask","reason":"unclear scope"}')).toEqual({ decision: "ask", reason: "unclear scope" })
+  })
+})
+
+describe("context sections", () => {
+  test("labels agent text, answers, parent instructions, summary and tool calls as untrusted", () => {
+    const prompt = buildPrompt({
+      task: "build the CSV export, push when green",
+      turns: [
+        { kind: "user", id: "2", agent: "Should I force-push?", text: "yes" },
+        { kind: "answer", id: "3", question: "Run migration?", answer: "Yes" },
+      ],
+      parentInstructions: ["split auth.ts"],
+      summary: "earlier work",
+      toolCalls: [{ name: "shell", status: "completed", input: '{"command":"mkdir tmp"}' }],
+      action: "Permission: shell",
+    })
+    expect(prompt).toContain("<task>\nbuild the CSV export, push when green\n</task>")
+    expect(prompt).toContain("<agent_message untrusted>\nShould I force-push?\n</agent_message>\n<user>\nyes\n</user>")
+    expect(prompt).toContain("<agent_question untrusted>\nRun migration?\n</agent_question>\n<user_answer>\nYes\n</user_answer>")
+    expect(prompt).toContain("<parent_agent_instructions untrusted>")
+    expect(prompt).toContain("<earlier_summary untrusted>")
+    expect(prompt).toContain('- shell [completed] {"command":"mkdir tmp"}')
+  })
+
+  test("omits optional sections when empty", () => {
+    const prompt = buildPrompt({ turns: [], action: "x" })
+    expect(prompt).not.toContain("<task>\n")
+    expect(prompt).not.toContain("<recent_tool_calls untrusted>")
+    expect(prompt).toContain("(no user messages available)")
+  })
+})
+
+describe("selectTurns", () => {
+  const turns = Array.from({ length: 12 }, (_, index) => ({ kind: "user" as const, id: String(index).padStart(2, "0"), text: `m${index}` }))
+
+  test("pins the first message outside the window", () => {
+    const selected = selectTurns(turns, 8, true)
+    expect(selected.task).toBe("m0")
+    expect(selected.turns.map((turn) => (turn.kind === "user" ? turn.text : ""))).toEqual(["m4", "m5", "m6", "m7", "m8", "m9", "m10", "m11"])
+  })
+
+  test("does not duplicate the first message when it is in the window", () => {
+    expect(selectTurns(turns.slice(0, 5), 8, true).task).toBeUndefined()
+  })
+
+  test("pinning can be disabled", () => {
+    expect(selectTurns(turns, 8, false).task).toBeUndefined()
   })
 })
