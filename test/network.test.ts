@@ -113,9 +113,10 @@ describe("prompt", () => {
     expect(prompt.indexOf("This is a company laptop.")).toBeLessThan(prompt.indexOf("<conversation>"))
   })
 
-  test("defaults review webfetch and code mode", () => {
+  test("defaults review everything not trusted, and code mode", () => {
     const options = resolveOptions({})
-    expect(options.review).toEqual(["shell", "webfetch"])
+    expect(options.review).toEqual(["*"])
+    expect(options.trust).toContain("edit")
     expect(options.reviewCode).toBe(true)
     expect(resolveOptions({ reviewCode: false }).reviewCode).toBe(false)
   })

@@ -20,6 +20,7 @@ import {
   decideOutcome,
   escalate,
   isReadOnlyShell,
+  isConfigEdit,
   isSensitivePath,
   mayUseNetwork,
   parseVerdict,
@@ -71,6 +72,8 @@ const plugin: Plugin.Plugin = {
       ctx.options.logFile === false ? undefined : typeof ctx.options.logFile === "string" ? ctx.options.logFile : defaultLogFile()
     const logPrompt = ctx.options.logPrompt === true
     const streaks = new Map<string, number>()
+    // Code-mode snippets (by tool call ID) that the reviewer allowed.
+    const reviewedSnippets = new Set<string>()
     const allowed = new Map<string, number>()
     const writes = new Map<string, Promise<void>>()
 
@@ -222,11 +225,13 @@ const plugin: Plugin.Plugin = {
     const evaluate = async (event: Request) => {
       const original = event.effect
       if (original === "deny" || options.skip.includes(event.action)) return
-      const review = event.codeMode ? options.reviewCode : shouldReview(event.action, original, options)
+      // Calls made inside a code-mode snippet that was just reviewed and allowed are covered by that review.
+      if (!event.codeMode && original === "allow" && event.source && reviewedSnippets.has(event.source.id)) return
+      const review = event.codeMode ? options.reviewCode : shouldReview(event.action, original, options, event.resources)
       // Code mode can only be refused, never turned into a prompt.
       const policy = event.codeMode ? { ...options, escalation: "deny" as const } : options
       const watch = watchList(options)
-      const network = mayUseNetwork(event.action)
+      const network = mayUseNetwork(event.action) || isConfigEdit(event.action, event.resources, options)
       const gate = network && watch.length > 0 && options.onWatchedHost === "confirm"
       if (!review && !gate) return
       const started = Date.now()
@@ -419,7 +424,11 @@ const plugin: Plugin.Plugin = {
           request.effect = "deny"
           request.message = `Auto-mode could not review this code: ${String(error)}`
         }
-        if (request.effect === "allow") return
+        if (request.effect === "allow") {
+          reviewedSnippets.add(event.id)
+          if (reviewedSnippets.size > 500) reviewedSnippets.delete(reviewedSnippets.values().next().value!)
+          return
+        }
         const reason = request.message ?? "Blocked by auto-mode safety review."
         event.input = { ...fields, code: `throw new Error(${JSON.stringify(reason)})` }
       })
@@ -427,6 +436,7 @@ const plugin: Plugin.Plugin = {
     return () => {
       streaks.clear()
       allowed.clear()
+      reviewedSnippets.clear()
     }
   },
 }

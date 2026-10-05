@@ -7,8 +7,15 @@ import { builtinWatchHosts, renderHosts, renderScripts, type HostNote, type Scri
 export type Effect = "allow" | "ask" | "deny"
 
 export interface Options {
-  /** Actions reviewed even when configured rules already allow them. `ask` decisions are always reviewed. */
+  /** Actions reviewed even when configured rules already allow them ("*" = all). `ask` decisions are always reviewed. */
   review: string[]
+  /**
+   * Allowed actions that run without review even under "*": local reads, searches and edits. `ask` decisions are
+   * still reviewed, and edits to configuration that redirects network access or runs code later are reviewed anyway.
+   */
+  trust: string[]
+  /** Extra path patterns (regular expressions) whose edits are always reviewed, added to the built-in list. */
+  reviewPaths: string[]
   /** Actions never reviewed. */
   skip: string[]
   /** How many of the most recent conversation turns (your messages and question answers) to include. */
@@ -62,7 +69,9 @@ export interface Options {
 }
 
 export const defaults: Options = {
-  review: ["shell", "webfetch"],
+  review: ["*"],
+  trust: ["read", "glob", "grep", "list", "lsp", "todowrite", "todoread", "skill", "subagent", "edit", "write", "patch"],
+  reviewPaths: [],
   skip: ["question"],
   userMessages: 20,
   pinFirst: false,
@@ -95,6 +104,8 @@ export function resolveOptions(input: Readonly<Record<string, unknown>> | undefi
   return {
     review: strings(raw.review, defaults.review),
     skip: strings(raw.skip, defaults.skip),
+    trust: strings(raw.trust, defaults.trust),
+    reviewPaths: strings(raw.reviewPaths, defaults.reviewPaths),
     userMessages: int(raw.userMessages, defaults.userMessages),
     pinFirst: typeof raw.pinFirst === "boolean" ? raw.pinFirst : defaults.pinFirst,
     agentContextChars: int(raw.agentContextChars, defaults.agentContextChars),
@@ -130,11 +141,36 @@ export function mayUseNetwork(action: string) {
   return !localOnly.has(action)
 }
 
+// Files that change where tools connect, or that run code later (hooks, CI, shell startup, build config). An edit
+// here can set up exfiltration that the later command never shows, e.g. a registry mirror in .npmrc.
+const configPaths =
+  /(^|\/)(\.git\/(hooks\/|config$)|\.githooks\/|\.husky\/|\.github\/workflows\/|\.gitlab-ci\.ya?ml$|\.pre-commit-config\.ya?ml$|\.envrc$|\.npmrc$|\.yarnrc(\.yml)?$|\.pnpmrc$|bunfig\.toml$|\.pypirc$|pip\.(conf|ini)$|uv\.toml$|pyproject\.toml$|poetry\.toml$|\.condarc$|\.cargo\/config(\.toml)?$|go\.env$|\.docker\/config\.json$|daemon\.json$|\.gradle\/gradle\.properties$|settings\.xml$|\.vscode\/(tasks|settings|launch)\.json$|\.(bash|zsh)rc$|\.(bash_|z)?profile$|\.zshenv$|\.gitconfig$|\.ssh\/|Makefile$|justfile$)/i
+
+/** Whether an edit to this path is always reviewed, even when edits are trusted. */
+export function isConfigPath(file: string, extra: ReadonlyArray<string> = []) {
+  if (configPaths.test(file)) return true
+  return extra.some((pattern) => {
+    try {
+      return new RegExp(pattern).test(file)
+    } catch {
+      return false
+    }
+  })
+}
+
+const editActions = new Set(["edit", "write", "patch"])
+
+/** Whether this is an edit to a configuration file that is reviewed regardless of `trust`. */
+export function isConfigEdit(action: string, resources: ReadonlyArray<string>, options: Pick<Options, "reviewPaths">) {
+  return editActions.has(action) && resources.some((resource) => isConfigPath(resource, options.reviewPaths))
+}
+
 /** Whether a permission decision should go to the reviewer at all. */
-export function shouldReview(action: string, effect: Effect, options: Options) {
+export function shouldReview(action: string, effect: Effect, options: Options, resources: ReadonlyArray<string> = []) {
   if (effect === "deny") return false
   if (options.skip.includes(action)) return false
   if (effect === "ask") return true
+  if (options.trust.includes(action)) return isConfigEdit(action, resources, options)
   return options.review.includes(action) || options.review.includes("*")
 }
 

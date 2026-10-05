@@ -86,10 +86,31 @@ describe("shouldReview", () => {
     expect(shouldReview("shell", "deny", defaults)).toBe(false)
   })
 
-  test("reviews allowed actions only when listed", () => {
+  test("reviews every allowed action except trusted ones", () => {
     expect(shouldReview("shell", "allow", defaults)).toBe(true)
-    expect(shouldReview("edit", "allow", defaults)).toBe(false)
-    expect(shouldReview("edit", "allow", { ...defaults, review: ["*"] })).toBe(true)
+    expect(shouldReview("webfetch", "allow", defaults)).toBe(true)
+    expect(shouldReview("websearch", "allow", defaults)).toBe(true)
+    expect(shouldReview("slack_send_message", "allow", defaults)).toBe(true)
+    expect(shouldReview("remote-workspace_exec", "allow", defaults)).toBe(true)
+    expect(shouldReview("read", "allow", defaults, ["src/a.ts"])).toBe(false)
+    expect(shouldReview("edit", "allow", defaults, ["src/a.ts"])).toBe(false)
+  })
+
+  test("an explicit review list reviews only what it names", () => {
+    const options = { ...defaults, review: ["shell"] }
+    expect(shouldReview("shell", "allow", options)).toBe(true)
+    expect(shouldReview("webfetch", "allow", options)).toBe(false)
+  })
+
+  test("trusted actions are still reviewed when they ask", () => {
+    expect(shouldReview("read", "ask", defaults, [".env"])).toBe(true)
+  })
+
+  test("edits to configuration are reviewed even though edits are trusted", () => {
+    for (const file of [".npmrc", "pip.conf", "pyproject.toml", ".git/hooks/pre-commit", ".github/workflows/ci.yml", "/home/dev/.zshrc", "Makefile", ".cargo/config.toml"])
+      expect(shouldReview("edit", "allow", defaults, [file])).toBe(true)
+    expect(shouldReview("write", "allow", defaults, ["src/npmrc.ts"])).toBe(false)
+    expect(shouldReview("edit", "allow", { ...defaults, reviewPaths: ["^deploy/"] }, ["deploy/run.sh"])).toBe(true)
   })
 
   test("skip wins", () => {
