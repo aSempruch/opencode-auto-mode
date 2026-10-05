@@ -1,5 +1,6 @@
 import type { Plugin } from "@opencode/plugin"
-import { appendFile, mkdir } from "node:fs/promises"
+import { createHash } from "node:crypto"
+import { appendFile, mkdir, readFile as fsReadFile, stat } from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import {
@@ -13,15 +14,20 @@ import {
   turnsFromContext,
   type ContextMessage,
 } from "./context.ts"
+import { describeHosts, extractHosts, isWatched, scriptTargets, type ScriptSource } from "./network.ts"
 import {
   buildPrompt,
   decideOutcome,
+  escalate,
   isReadOnlyShell,
+  isSensitivePath,
+  mayUseNetwork,
   parseVerdict,
   renderAction,
   resolveOptions,
   selectTurns,
   shouldReview,
+  watchList,
   type Effect,
   type Turn,
 } from "./review.ts"
@@ -33,6 +39,7 @@ const STORED_TURNS = 60
 const MAX_PARENT_DEPTH = 8
 const SUMMARY_CHARS = 2000
 const TOOL_INPUT_CHARS = 200
+const MAX_SCRIPT_BYTES = 1_000_000
 
 function defaultLogFile() {
   const state = process.env.XDG_STATE_HOME || path.join(os.homedir(), ".local", "state")
@@ -118,9 +125,91 @@ const plugin: Plugin.Plugin = {
       )
     })
 
+    // Read the local scripts a shell command runs (and package.json scripts it invokes), within a character budget.
+    const readScripts = async (commands: ReadonlyArray<string>, directory: string) => {
+      const scripts: ScriptSource[] = []
+      if (options.maxScriptChars <= 0) return scripts
+      let budget = options.maxScriptChars
+      const seen = new Set<string>()
+      const add = (label: string, content: string) => {
+        if (budget <= 0 || seen.has(label)) return
+        seen.add(label)
+        const clipped = clip(content, budget)
+        budget -= clipped.length
+        scripts.push({ path: label, content: clipped })
+      }
+      const readFile = async (file: string) => {
+        const resolved = path.resolve(directory, file.replace(/^~(?=\/)/, os.homedir()))
+        // Never copy secrets into the prompt, which may go to a hosted model.
+        if (seen.has(resolved) || isSensitivePath(resolved)) return
+        try {
+          const info = await stat(resolved)
+          if (!info.isFile() || info.size > MAX_SCRIPT_BYTES) return
+          const content = await fsReadFile(resolved, "utf8")
+          if (!content.includes("\0")) add(resolved, content)
+        } catch {}
+      }
+      let packageScripts: Record<string, unknown> | undefined
+      const visit = async (command: string, depth: number) => {
+        const targets = scriptTargets(command)
+        for (const file of targets.files) await readFile(file)
+        if (!targets.packageScripts.length || depth > 0) return
+        if (packageScripts === undefined) {
+          try {
+            const manifest = JSON.parse(await fsReadFile(path.join(directory, "package.json"), "utf8")) as { scripts?: unknown }
+            packageScripts = typeof manifest.scripts === "object" && manifest.scripts ? (manifest.scripts as Record<string, unknown>) : {}
+          } catch {
+            packageScripts = {}
+          }
+        }
+        for (const name of targets.packageScripts) {
+          for (const entry of [`pre${name}`, name, `post${name}`]) {
+            const body = packageScripts[entry]
+            if (typeof body !== "string") continue
+            add(`package.json#scripts.${entry}`, body)
+            await visit(body, depth + 1)
+          }
+        }
+      }
+      for (const command of commands) await visit(command, 0)
+      return scripts
+    }
+
+    // The user's side of the conversation, from the root session (subagents inherit the user's authorization).
+    const userContext = async (sessionID: Parameters<typeof ctx.session.get>[0]["sessionID"], messages: ReadonlyArray<ContextMessage>) => {
+      let session: { parentID?: string; model?: ModelRef } | undefined
+      try {
+        session = (await ctx.session.get({ sessionID })) as typeof session
+      } catch {}
+      let rootID: string = sessionID
+      let parentID = session?.parentID
+      for (let depth = 0; parentID && depth < MAX_PARENT_DEPTH; depth++) {
+        rootID = parentID
+        try {
+          parentID = ((await ctx.session.get({ sessionID: parentID as typeof sessionID })) as { parentID?: string }).parentID
+        } catch {
+          break
+        }
+      }
+      const rootMessages = rootID === sessionID ? messages : await contextOf(rootID)
+      await writes.get(rootID)
+      const extract = { agentChars: options.agentContextChars, messageChars: options.maxMessageChars }
+      const turns = mergeTurns(await loadTurns(rootID), turnsFromContext(rootMessages, extract))
+      // Text the user wrote or replied to: where a destination must appear before the user has "seen" it.
+      const seen = turns.flatMap((turn) =>
+        turn.kind === "user" ? [turn.text, ...(turn.agent ? [turn.agent] : [])] : [turn.question, turn.answer],
+      )
+      return { session, rootID, rootMessages, turns, seen }
+    }
+
     await ctx.permission.hook("evaluate", async (event) => {
       const original = event.effect as Effect
-      if (!shouldReview(event.action, original, options)) return
+      if (original === "deny" || options.skip.includes(event.action)) return
+      const review = shouldReview(event.action, original, options)
+      const watch = watchList(options)
+      const network = mayUseNetwork(event.action)
+      const gate = network && watch.length > 0 && options.onWatchedHost === "confirm"
+      if (!review && !gate) return
       const started = Date.now()
       const base = { sessionID: event.sessionID, action: event.action, resources: event.resources, original }
 
@@ -130,59 +219,67 @@ const plugin: Plugin.Plugin = {
         void log({ ...base, effect, via, message, ms: Date.now() - started, ...extra })
       }
 
-      if (options.fastAllow && event.action === "shell" && isReadOnlyShell(event.resources)) {
+      if (review && options.fastAllow && event.action === "shell" && isReadOnlyShell(event.resources)) {
         return decide("allow", undefined, "fast-path")
       }
 
-      const cacheKey = JSON.stringify([event.sessionID, event.action, event.resources])
-      const cached = allowed.get(cacheKey)
-      if (cached !== undefined && Date.now() - cached < options.cacheMs) return decide("allow", undefined, "cache")
-
       const messages = await contextOf(event.sessionID)
+      const source = event.source
+      const origin = source
+        ? messages.find((message) => message.id === source.messageID && message.type === "assistant")
+        : undefined
+      const call = source ? origin?.content?.find((item) => item.type === "tool" && item.id === source.id) : undefined
+      const input = call?.state && call.state.status !== "streaming" ? call.state.input : undefined
+      const fields = input && typeof input === "object" ? (input as Record<string, unknown>) : {}
+      const workdir = [fields.workdir, fields.cwd, fields.directory].find((value) => typeof value === "string" && value)
+      const directory = path.resolve(ctx.location.directory, (workdir as string | undefined) ?? ".")
 
-      // Subagents: authorization comes from the user's root session, not the parent agent's instructions.
-      let session: { parentID?: string; model?: ModelRef } | undefined
-      try {
-        session = (await ctx.session.get({ sessionID: event.sessionID })) as typeof session
-      } catch {}
-      let rootID: string = event.sessionID
-      let parentID = session?.parentID
-      for (let depth = 0; parentID && depth < MAX_PARENT_DEPTH; depth++) {
-        rootID = parentID
-        try {
-          parentID = ((await ctx.session.get({ sessionID: parentID as typeof event.sessionID })) as { parentID?: string }).parentID
-        } catch {
-          break
-        }
+      const scripts = event.action === "shell" ? await readScripts(event.resources, directory) : []
+      const hosts = network
+        ? extractHosts(
+            [...event.resources, JSON.stringify(input ?? {}), JSON.stringify(event.metadata ?? {}), ...scripts.map((script) => script.content)].join("\n"),
+            watch,
+          )
+        : []
+      const watched = hosts.filter((host) => isWatched(host, watch))
+      if (!review && !watched.length) return
+
+      // An identical command is re-reviewed whenever a script it runs has changed.
+      const digest = createHash("sha256").update(JSON.stringify(scripts)).digest("hex").slice(0, 16)
+      const cacheKey = JSON.stringify([event.sessionID, event.action, event.resources, digest])
+      const cached = allowed.get(cacheKey)
+      if (review && cached !== undefined && Date.now() - cached < options.cacheMs) return decide("allow", undefined, "cache")
+
+      const user = await userContext(event.sessionID, messages)
+      const hostNotes = describeHosts(hosts, watch, user.seen)
+      const unseen = hostNotes.filter((note) => note.watched && !note.mentioned).map((note) => note.host)
+      if (gate && unseen.length) {
+        // Deterministic: a watched destination the user never saw is not left to the model's judgment.
+        const outcome = escalate(
+          `Auto-mode: this action contacts ${unseen.join(", ")}, a watched destination (China-based service or mirror) that the user has not named in this conversation. Do not substitute another unrequested host or mirror.`,
+          options,
+        )
+        return decide(outcome.effect, outcome.message, "watched-host", { hosts: unseen })
       }
-      const rootMessages = rootID === event.sessionID ? messages : await contextOf(rootID)
-      await writes.get(rootID)
-      const extract = { agentChars: options.agentContextChars, messageChars: options.maxMessageChars }
-      const turns = mergeTurns(await loadTurns(rootID), turnsFromContext(rootMessages, extract))
-      const selected = selectTurns(turns, options.userMessages, options.pinFirst)
+      if (!review) return
+
+      const selected = selectTurns(user.turns, options.userMessages, options.pinFirst)
 
       // Compaction dropped history we have no verbatim record of: show its summary, marked untrusted.
-      const compaction = latestCompaction(rootMessages)
+      const compaction = latestCompaction(user.rootMessages)
       const summary =
-        compaction && !turns.some((turn) => turn.id < compaction.id) ? clip(compaction.summary, SUMMARY_CHARS) : undefined
+        compaction && !user.turns.some((turn) => turn.id < compaction.id) ? clip(compaction.summary, SUMMARY_CHARS) : undefined
 
       const parentInstructions =
-        rootID === event.sessionID
+        user.rootID === event.sessionID
           ? undefined
           : turnsFromContext(messages, { agentChars: 0, messageChars: options.maxMessageChars })
               .flatMap((turn) => (turn.kind === "user" ? [turn.text] : []))
               .slice(-2)
 
       // Review with the model that issued this tool call, so no other model has to be loaded.
-      const source = event.source
-      const origin = source
-        ? messages.find((message) => message.id === source.messageID && message.type === "assistant")
-        : undefined
-      let model: ModelRef | undefined = origin?.model ?? session?.model
+      let model: ModelRef | undefined = origin?.model ?? user.session?.model
       if (model && options.variant) model = { ...model, variant: options.variant }
-      const call = source
-        ? origin?.content?.find((item) => item.type === "tool" && item.id === source.id)
-        : undefined
 
       const prompt = buildPrompt({
         task: selected.task,
@@ -200,19 +297,24 @@ const plugin: Plugin.Plugin = {
             effect: original,
             resources: event.resources,
             tool: call?.name,
-            input: call?.state && call.state.status !== "streaming" ? call.state.input : undefined,
+            input,
             metadata: event.metadata,
-            directory: ctx.location.directory,
+            directory,
           },
           options.maxActionChars,
         ),
+        hosts: hostNotes,
+        scripts,
+        extraRules: options.extraRules,
       })
       const shape = {
         turns: selected.turns.length,
         pinned: Boolean(selected.task),
         summary: Boolean(summary),
-        subagent: rootID !== event.sessionID,
+        subagent: user.rootID !== event.sessionID,
         promptChars: prompt.length,
+        ...(scripts.length ? { scripts: scripts.map((script) => script.path) } : {}),
+        ...(hosts.length ? { hosts } : {}),
         ...(logPrompt ? { prompt } : {}),
       }
 
