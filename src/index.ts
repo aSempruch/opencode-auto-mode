@@ -34,12 +34,28 @@ import {
 
 type ModelRef = { providerID: string; id: string; variant?: string }
 
+/** A permission evaluation, or a code-mode snippet presented as one. The result is written to effect/message. */
+type Request = {
+  readonly sessionID: string
+  readonly action: string
+  readonly resources: ReadonlyArray<string>
+  readonly metadata?: Record<string, unknown>
+  readonly source?: { readonly messageID: string; readonly id: string }
+  /** Tool input, when the caller has it (code mode); otherwise looked up from the session. */
+  readonly input?: unknown
+  /** Code mode runs outside OpenCode's permission system, so there is no prompt to escalate to. */
+  readonly codeMode?: boolean
+  effect: Effect
+  message?: string
+}
+
 // Durable per-session record of the user's turns, so authorization survives compaction.
 const STORED_TURNS = 60
 const MAX_PARENT_DEPTH = 8
 const SUMMARY_CHARS = 2000
 const TOOL_INPUT_CHARS = 200
 const MAX_SCRIPT_BYTES = 1_000_000
+const CODE_MODE_TOOL = "execute"
 
 function defaultLogFile() {
   const state = process.env.XDG_STATE_HOME || path.join(os.homedir(), ".local", "state")
@@ -49,6 +65,7 @@ function defaultLogFile() {
 const plugin: Plugin.Plugin = {
   id: "auto-mode",
   async setup(ctx) {
+    type SessionID = Parameters<typeof ctx.session.get>[0]["sessionID"]
     const options = resolveOptions(ctx.options)
     const logFile =
       ctx.options.logFile === false ? undefined : typeof ctx.options.logFile === "string" ? ctx.options.logFile : defaultLogFile()
@@ -202,10 +219,12 @@ const plugin: Plugin.Plugin = {
       return { session, rootID, rootMessages, turns, seen }
     }
 
-    await ctx.permission.hook("evaluate", async (event) => {
-      const original = event.effect as Effect
+    const evaluate = async (event: Request) => {
+      const original = event.effect
       if (original === "deny" || options.skip.includes(event.action)) return
-      const review = shouldReview(event.action, original, options)
+      const review = event.codeMode ? options.reviewCode : shouldReview(event.action, original, options)
+      // Code mode can only be refused, never turned into a prompt.
+      const policy = event.codeMode ? { ...options, escalation: "deny" as const } : options
       const watch = watchList(options)
       const network = mayUseNetwork(event.action)
       const gate = network && watch.length > 0 && options.onWatchedHost === "confirm"
@@ -223,13 +242,13 @@ const plugin: Plugin.Plugin = {
         return decide("allow", undefined, "fast-path")
       }
 
-      const messages = await contextOf(event.sessionID)
+      const messages = await contextOf(event.sessionID as SessionID)
       const source = event.source
       const origin = source
         ? messages.find((message) => message.id === source.messageID && message.type === "assistant")
         : undefined
       const call = source ? origin?.content?.find((item) => item.type === "tool" && item.id === source.id) : undefined
-      const input = call?.state && call.state.status !== "streaming" ? call.state.input : undefined
+      const input = event.input ?? (call?.state && call.state.status !== "streaming" ? call.state.input : undefined)
       const fields = input && typeof input === "object" ? (input as Record<string, unknown>) : {}
       const workdir = [fields.workdir, fields.cwd, fields.directory].find((value) => typeof value === "string" && value)
       const directory = path.resolve(ctx.location.directory, (workdir as string | undefined) ?? ".")
@@ -250,18 +269,21 @@ const plugin: Plugin.Plugin = {
       const cached = allowed.get(cacheKey)
       if (review && cached !== undefined && Date.now() - cached < options.cacheMs) return decide("allow", undefined, "cache")
 
-      const user = await userContext(event.sessionID, messages)
+      const user = await userContext(event.sessionID as SessionID, messages)
       const hostNotes = describeHosts(hosts, watch, user.seen)
       const unseen = hostNotes.filter((note) => note.watched && !note.mentioned).map((note) => note.host)
       if (gate && unseen.length) {
         // Deterministic: a watched destination the user never saw is not left to the model's judgment.
         const outcome = escalate(
           `Auto-mode: this action contacts ${unseen.join(", ")}, a watched destination (China-based service or mirror) that the user has not named in this conversation. Do not substitute another unrequested host or mirror.`,
-          options,
+          policy,
         )
         return decide(outcome.effect, outcome.message, "watched-host", { hosts: unseen })
       }
       if (!review) return
+      // A fetch of a page whose host the user named needs no model call.
+      if (event.action === "webfetch" && hostNotes.length && hostNotes.every((note) => note.mentioned && !note.watched))
+        return decide("allow", undefined, "user-host", { hosts })
 
       const selected = selectTurns(user.turns, options.userMessages, options.pinFirst)
 
@@ -296,7 +318,7 @@ const plugin: Plugin.Plugin = {
             action: event.action,
             effect: original,
             resources: event.resources,
-            tool: call?.name,
+            tool: event.codeMode ? "execute (code mode: JavaScript with network access, run outside the permission system)" : call?.name,
             input,
             metadata: event.metadata,
             directory,
@@ -344,18 +366,18 @@ const plugin: Plugin.Plugin = {
           })
         ).text
       } catch (error) {
-        const outcome = decideOutcome(undefined, 0, options, `Auto-mode reviewer failed: ${String(error)}`)
+        const outcome = decideOutcome(undefined, 0, policy, `Auto-mode reviewer failed: ${String(error)}`)
         return decide(outcome.effect, outcome.message, "error", { model, ...shape })
       }
 
       const verdict = parseVerdict(text)
       if (!verdict) {
-        const outcome = decideOutcome(undefined, 0, options)
+        const outcome = decideOutcome(undefined, 0, policy)
         return decide(outcome.effect, outcome.message, "unparseable", { model, ...shape, reply: text.slice(0, 500) })
       }
 
       const streak = verdict.decision === "block" ? (streaks.get(event.sessionID) ?? 0) + 1 : 0
-      const outcome = decideOutcome(verdict, streak, options)
+      const outcome = decideOutcome(verdict, streak, policy)
       if (verdict.decision === "allow") allowed.set(cacheKey, Date.now())
       // A streak ends on any non-block verdict, and once it has escalated.
       if (verdict.decision !== "block" || (options.maxConsecutiveBlocks > 0 && streak >= options.maxConsecutiveBlocks))
@@ -368,7 +390,39 @@ const plugin: Plugin.Plugin = {
         reason: verdict.reason,
         ...(streak ? { streak } : {}),
       })
+    }
+
+    await ctx.permission.hook("evaluate", async (event) => {
+      await evaluate(event as unknown as Request & typeof event)
     })
+
+    // Code mode's execute tool runs JavaScript (fetch included) without any permission check, so the snippet is
+    // reviewed before it runs. OpenCode awaits this hook and runs the input it leaves behind, so a blocked snippet
+    // is replaced with one that throws the reason.
+    if (options.reviewCode)
+      await ctx.tool.hook("execute.before", async (event) => {
+        if (event.tool !== CODE_MODE_TOOL) return
+        const fields = event.input && typeof event.input === "object" ? (event.input as Record<string, unknown>) : {}
+        const code = typeof fields.code === "string" ? fields.code : JSON.stringify(event.input ?? {})
+        const request: Request = {
+          sessionID: event.sessionID,
+          action: CODE_MODE_TOOL,
+          resources: [code],
+          source: { messageID: event.messageID, id: event.id },
+          input: event.input,
+          codeMode: true,
+          effect: "allow",
+        }
+        try {
+          await evaluate(request)
+        } catch (error) {
+          request.effect = "deny"
+          request.message = `Auto-mode could not review this code: ${String(error)}`
+        }
+        if (request.effect === "allow") return
+        const reason = request.message ?? "Blocked by auto-mode safety review."
+        event.input = { ...fields, code: `throw new Error(${JSON.stringify(reason)})` }
+      })
 
     return () => {
       streaks.clear()

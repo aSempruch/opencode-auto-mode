@@ -113,6 +113,13 @@ describe("prompt", () => {
     expect(prompt.indexOf("This is a company laptop.")).toBeLessThan(prompt.indexOf("<conversation>"))
   })
 
+  test("defaults review webfetch and code mode", () => {
+    const options = resolveOptions({})
+    expect(options.review).toEqual(["shell", "webfetch"])
+    expect(options.reviewCode).toBe(true)
+    expect(resolveOptions({ reviewCode: false }).reviewCode).toBe(false)
+  })
+
   test("network-capable actions", () => {
     expect(mayUseNetwork("shell")).toBe(true)
     expect(mayUseNetwork("webfetch")).toBe(true)

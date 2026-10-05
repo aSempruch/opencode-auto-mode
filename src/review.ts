@@ -57,10 +57,12 @@ export interface Options {
   maxScriptChars: number
   /** Your own policy text, appended to the reviewer's rules (for example, what counts as confidential at work). */
   extraRules?: string
+  /** Review code mode's execute tool, which runs JavaScript with network access outside OpenCode's permission system. */
+  reviewCode: boolean
 }
 
 export const defaults: Options = {
-  review: ["shell"],
+  review: ["shell", "webfetch"],
   skip: ["question"],
   userMessages: 20,
   pinFirst: false,
@@ -79,6 +81,7 @@ export const defaults: Options = {
   builtinWatchHosts: true,
   onWatchedHost: "confirm",
   maxScriptChars: 12_000,
+  reviewCode: true,
 }
 
 const effects = new Set(["allow", "ask", "deny"])
@@ -110,6 +113,7 @@ export function resolveOptions(input: Readonly<Record<string, unknown>> | undefi
     builtinWatchHosts: typeof raw.builtinWatchHosts === "boolean" ? raw.builtinWatchHosts : defaults.builtinWatchHosts,
     onWatchedHost: raw.onWatchedHost === "review" ? "review" : "confirm",
     maxScriptChars: int(raw.maxScriptChars, defaults.maxScriptChars),
+    reviewCode: typeof raw.reviewCode === "boolean" ? raw.reviewCode : defaults.reviewCode,
     extraRules: typeof raw.extraRules === "string" && raw.extraRules.trim() ? raw.extraRules.trim() : undefined,
   }
 }
