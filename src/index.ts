@@ -14,6 +14,7 @@ import {
   turnsFromContext,
   type ContextMessage,
 } from "./context.ts"
+import { extractInstructions, pinInstructions, renderInstructions, type Instruction } from "./instructions.ts"
 import { describeHosts, extractHosts, isWatched, scriptTargets, type ScriptSource } from "./network.ts"
 import {
   buildPrompt,
@@ -72,6 +73,9 @@ const plugin: Plugin.Plugin = {
       ctx.options.logFile === false ? undefined : typeof ctx.options.logFile === "string" ? ctx.options.logFile : defaultLogFile()
     const logPrompt = ctx.options.logPrompt === true
     const streaks = new Map<string, number>()
+    // Refused actions, with the newest user turn at the time: an identical retry is refused again until the user
+    // says something new, so a second review cannot flip the answer.
+    const refused = new Map<string, { latest: string; effect: Effect; message?: string }>()
     // Code-mode snippets (by tool call ID) that the reviewer allowed.
     const reviewedSnippets = new Set<string>()
     const allowed = new Map<string, number>()
@@ -94,21 +98,25 @@ const plugin: Plugin.Plugin = {
         return []
       }
     }
-    // Serialize writes per session so concurrent captures don't drop each other.
-    const record = (sessionID: string, produce: () => Promise<Turn[]>) => {
-      const next = (writes.get(sessionID) ?? Promise.resolve()).then(async () => {
+    // Serialize writes per storage key so concurrent captures don't drop each other.
+    const serialize = (key: string, write: () => Promise<void>) => {
+      const next = (writes.get(key) ?? Promise.resolve()).then(async () => {
         try {
-          const turns = await produce()
-          if (!turns.length) return
-          const merged = capTurns(mergeTurns(await loadTurns(sessionID), turns), STORED_TURNS)
-          await ctx.storage.set(key(sessionID), merged as unknown as Parameters<typeof ctx.storage.set>[1])
+          await write()
         } catch (error) {
-          void log({ sessionID, warning: `failed to record turn: ${String(error)}` })
+          void log({ key, warning: `failed to store: ${String(error)}` })
         }
       })
-      writes.set(sessionID, next)
+      writes.set(key, next)
       return next
     }
+    const record = (sessionID: string, produce: () => Promise<Turn[]>) =>
+      serialize(key(sessionID), async () => {
+        const turns = await produce()
+        if (!turns.length) return
+        const merged = capTurns(mergeTurns(await loadTurns(sessionID), turns), STORED_TURNS)
+        await ctx.storage.set(key(sessionID), merged as unknown as Parameters<typeof ctx.storage.set>[1])
+      })
     const contextOf = async (sessionID: string) => {
       try {
         return (await ctx.session.context({ sessionID })) as unknown as ReadonlyArray<ContextMessage>
@@ -117,6 +125,33 @@ const plugin: Plugin.Plugin = {
         return []
       }
     }
+
+    // Pin the instruction files in each session's system prompt at their first version (see instructions.ts).
+    const pinned = new Map<string, Instruction[]>()
+    const instructionKey = (sessionID: string) => `instructions/${sessionID}`
+    const loadInstructions = async (sessionID: string) => {
+      const cached = pinned.get(sessionID)
+      if (cached) return cached
+      try {
+        const value = await ctx.storage.get(instructionKey(sessionID))
+        const stored = Array.isArray(value) ? (value as unknown as Instruction[]) : []
+        pinned.set(sessionID, stored)
+        return stored
+      } catch {
+        return []
+      }
+    }
+    if (options.maxInstructionChars > 0)
+      await ctx.session.hook("context", (event) => {
+        const current = extractInstructions(event.system.map((part) => part.text))
+        if (!current.length) return
+        void serialize(instructionKey(event.sessionID), async () => {
+          const next = pinInstructions(await loadInstructions(event.sessionID), current)
+          if (!next) return
+          pinned.set(event.sessionID, next)
+          await ctx.storage.set(instructionKey(event.sessionID), next as unknown as Parameters<typeof ctx.storage.set>[1])
+        })
+      })
 
     // Capture each user prompt at admission, with the agent message it replies to.
     await ctx.session.hook("prompt", (event) => {
@@ -212,7 +247,7 @@ const plugin: Plugin.Plugin = {
         }
       }
       const rootMessages = rootID === sessionID ? messages : await contextOf(rootID)
-      await writes.get(rootID)
+      await writes.get(key(rootID))
       const extract = { agentChars: options.agentContextChars, messageChars: options.maxMessageChars }
       const turns = mergeTurns(await loadTurns(rootID), turnsFromContext(rootMessages, extract))
       // Text the user wrote or replied to: where a destination must appear before the user has "seen" it.
@@ -290,7 +325,24 @@ const plugin: Plugin.Plugin = {
       if (event.action === "webfetch" && hostNotes.length && hostNotes.every((note) => note.mentioned && !note.watched))
         return decide("allow", undefined, "user-host", { hosts })
 
+      const latest = user.turns.at(-1)?.id ?? ""
+      const previous = refused.get(cacheKey)
+      if (previous && previous.latest === latest)
+        return decide(
+          previous.effect,
+          `${previous.message ?? "Blocked by auto-mode safety review."} (Retrying the same action gets the same answer until the user says something new.)`,
+          "repeat",
+        )
+
       const selected = selectTurns(user.turns, options.userMessages, options.pinFirst)
+      // A subagent's own system prompt loads the same files; prefer the root session's pinned copy.
+      await writes.get(instructionKey(user.rootID))
+      await writes.get(instructionKey(event.sessionID))
+      const rootInstructions = options.maxInstructionChars > 0 ? await loadInstructions(user.rootID) : []
+      const instructionSet =
+        rootInstructions.length || user.rootID === event.sessionID || options.maxInstructionChars <= 0
+          ? rootInstructions
+          : await loadInstructions(event.sessionID)
 
       // Compaction dropped history we have no verbatim record of: show its summary, marked untrusted.
       const compaction = latestCompaction(user.rootMessages)
@@ -333,6 +385,7 @@ const plugin: Plugin.Plugin = {
         hosts: hostNotes,
         scripts,
         extraRules: options.extraRules,
+        instructions: renderInstructions(instructionSet, options.maxInstructionChars),
       })
       const shape = {
         turns: selected.turns.length,
@@ -340,6 +393,7 @@ const plugin: Plugin.Plugin = {
         summary: Boolean(summary),
         subagent: user.rootID !== event.sessionID,
         promptChars: prompt.length,
+        ...(instructionSet.length ? { instructions: instructionSet.map((item) => item.path) } : {}),
         ...(scripts.length ? { scripts: scripts.map((script) => script.path) } : {}),
         ...(hosts.length ? { hosts } : {}),
         ...(logPrompt ? { prompt } : {}),
@@ -383,7 +437,13 @@ const plugin: Plugin.Plugin = {
 
       const streak = verdict.decision === "block" ? (streaks.get(event.sessionID) ?? 0) + 1 : 0
       const outcome = decideOutcome(verdict, streak, policy)
-      if (verdict.decision === "allow") allowed.set(cacheKey, Date.now())
+      if (verdict.decision === "allow") {
+        allowed.set(cacheKey, Date.now())
+        refused.delete(cacheKey)
+      } else if (outcome.effect !== "allow") {
+        refused.set(cacheKey, { latest, effect: outcome.effect, message: outcome.message })
+        if (refused.size > 500) refused.delete(refused.keys().next().value!)
+      }
       // A streak ends on any non-block verdict, and once it has escalated.
       if (verdict.decision !== "block" || (options.maxConsecutiveBlocks > 0 && streak >= options.maxConsecutiveBlocks))
         streaks.delete(event.sessionID)
@@ -437,6 +497,7 @@ const plugin: Plugin.Plugin = {
       streaks.clear()
       allowed.clear()
       reviewedSnippets.clear()
+      refused.clear()
     }
   },
 }
