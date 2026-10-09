@@ -88,7 +88,7 @@ export const defaults: Options = {
   maxConsecutiveBlocks: 3,
   fastAllow: true,
   // Reviews queue behind every agent's generation on a shared local GPU, so this is a backstop for hung requests.
-  timeoutMs: 60 * 60_000,
+  timeoutMs: 3 * 60 * 60_000,
   maxActionChars: 6000,
   maxMessageChars: 2000,
   cacheMs: 10 * 60_000,

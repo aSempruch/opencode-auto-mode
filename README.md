@@ -105,7 +105,7 @@ OpenCode installs it from GitHub on first start. It checks plugins for updates a
         "maxConsecutiveBlocks": 3,   // escalate to a prompt after N blocks in a row (0 = never)
         "fastAllow": true,           // allow obvious read-only shell commands without a model call
         "variant": "low",            // optional: review with a different variant of the same model
-        "timeoutMs": 3600000,        // whole review, including time queued behind other requests (0 = no limit)
+        "timeoutMs": 10800000,       // whole review, including time queued behind other requests (0 = no limit)
         "cacheMs": 600000,           // reuse an allow for an identical action (and identical scripts) in the same session
         "maxScriptChars": 12000,     // show the source of local scripts a command runs (0 = off)
         "onWatchedHost": "confirm",  // "confirm": escalate unmentioned watched hosts without a model call; "review": only flag them
