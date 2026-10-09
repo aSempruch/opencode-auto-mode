@@ -427,3 +427,15 @@ export function parseVerdict(text: string): Verdict | undefined {
   if (keyword) return { decision: keyword[1]!.toLowerCase() as Verdict["decision"], reason: "" }
   return undefined
 }
+
+export type ToggleRequest = "on" | "off" | "status" | "flip"
+
+/** Parse the argument of the `/auto-mode` command. Undefined means it was not understood. */
+export function parseToggle(text: string | undefined): ToggleRequest | undefined {
+  const word = (text ?? "").trim().replace(/^\/auto-mode(?![\w-])/i, "").trim().split(/\s+/)[0]?.toLowerCase() ?? ""
+  if (!word || word === "toggle") return "flip"
+  if (["on", "enable", "resume"].includes(word)) return "on"
+  if (["off", "disable", "pause"].includes(word)) return "off"
+  if (word === "status") return "status"
+  return undefined
+}

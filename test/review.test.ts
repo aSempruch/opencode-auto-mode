@@ -5,6 +5,7 @@ import {
   decideOutcome,
   defaults,
   isReadOnlyShell,
+  parseToggle,
   parseVerdict,
   renderAction,
   resolveOptions,
@@ -236,5 +237,25 @@ describe("decideOutcome", () => {
   test("onError allow and deny are honored", () => {
     expect(decideOutcome(undefined, 0, { ...base, onError: "allow" })).toEqual({ effect: "allow", message: undefined })
     expect(decideOutcome(undefined, 0, { ...base, onError: "deny" }).effect).toBe("deny")
+  })
+})
+
+describe("parseToggle", () => {
+  test("explicit states", () => {
+    expect(parseToggle("off")).toBe("off")
+    expect(parseToggle(" ON ")).toBe("on")
+    expect(parseToggle("pause")).toBe("off")
+    expect(parseToggle("status")).toBe("status")
+  })
+  test("no argument flips", () => {
+    expect(parseToggle("")).toBe("flip")
+    expect(parseToggle(undefined)).toBe("flip")
+    expect(parseToggle("/auto-mode")).toBe("flip")
+  })
+  test("tolerates the command name and extra words", () => {
+    expect(parseToggle("/auto-mode off please")).toBe("off")
+  })
+  test("unknown argument", () => {
+    expect(parseToggle("maybe")).toBeUndefined()
   })
 })

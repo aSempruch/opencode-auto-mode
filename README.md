@@ -122,6 +122,12 @@ OpenCode installs it from GitHub on first start. It checks plugins for updates a
 
 OpenCode's default rules allow almost everything, so the plugin reviews every allowed action except the `trust` list. Remove entries from `trust` to review them too, for example `"edit"`. Every review costs a model call, though. Set `review` to an explicit list, such as `["shell", "webfetch"]`, to review only those actions; anything unlisted then runs unreviewed. Every `ask` goes through the reviewer either way.
 
+### Pausing review
+
+Each review is a model call, and on a single local GPU it queues behind the agent's own generation. To skip it for one conversation, send `/auto-mode off`. `/auto-mode on` resumes it, `/auto-mode status` reports it, and `/auto-mode` alone flips it. The setting belongs to the root session, so its subagents follow it, and it survives a server restart. Other sessions are not affected.
+
+While review is paused, OpenCode's configured rules decide on their own: allowed actions run, and `ask` rules show the normal permission prompt (which `--dangerously-skip-permissions` approves). The watched-host gate still runs, because it needs no model call. Decisions are logged with `via: "review-off"`, and each toggle is logged too. The confirmation is a note in the session that is delivered with your next message, because showing it sooner would start a model turn.
+
 ## Results
 
 These tests used Qwen3.8 27B (Q6_K, local llama.cpp via llama-swap) as both the agent and the reviewer.

@@ -24,6 +24,7 @@ import {
   isConfigEdit,
   isSensitivePath,
   mayUseNetwork,
+  parseToggle,
   parseVerdict,
   renderAction,
   resolveOptions,
@@ -230,8 +231,8 @@ const plugin: Plugin.Plugin = {
       return scripts
     }
 
-    // The user's side of the conversation, from the root session (subagents inherit the user's authorization).
-    const userContext = async (sessionID: Parameters<typeof ctx.session.get>[0]["sessionID"], messages: ReadonlyArray<ContextMessage>) => {
+    // The session a subagent was spawned from, followed to the top.
+    const rootOf = async (sessionID: SessionID) => {
       let session: { parentID?: string; model?: ModelRef } | undefined
       try {
         session = (await ctx.session.get({ sessionID })) as typeof session
@@ -241,11 +242,35 @@ const plugin: Plugin.Plugin = {
       for (let depth = 0; parentID && depth < MAX_PARENT_DEPTH; depth++) {
         rootID = parentID
         try {
-          parentID = ((await ctx.session.get({ sessionID: parentID as typeof sessionID })) as { parentID?: string }).parentID
+          parentID = ((await ctx.session.get({ sessionID: parentID as SessionID })) as { parentID?: string }).parentID
         } catch {
           break
         }
       }
+      return { session, rootID }
+    }
+
+    // Review switched off with /auto-mode, per root session so its subagents follow. Kept in storage across restarts.
+    const paused = new Map<string, boolean>()
+    const pauseKey = (sessionID: string) => `review/${sessionID}`
+    const isPaused = async (rootID: string) => {
+      const cached = paused.get(rootID)
+      if (cached !== undefined) return cached
+      let value = false
+      try {
+        value = (await ctx.storage.get(pauseKey(rootID))) === "off"
+      } catch {}
+      paused.set(rootID, value)
+      return value
+    }
+    const setPaused = (rootID: string, value: boolean) => {
+      paused.set(rootID, value)
+      return serialize(pauseKey(rootID), () => ctx.storage.set(pauseKey(rootID), value ? "off" : "on"))
+    }
+
+    // The user's side of the conversation, from the root session (subagents inherit the user's authorization).
+    const userContext = async (sessionID: SessionID, messages: ReadonlyArray<ContextMessage>) => {
+      const { session, rootID } = await rootOf(sessionID)
       const rootMessages = rootID === sessionID ? messages : await contextOf(rootID)
       await writes.get(key(rootID))
       const extract = { agentChars: options.agentContextChars, messageChars: options.maxMessageChars }
@@ -262,7 +287,7 @@ const plugin: Plugin.Plugin = {
       if (original === "deny" || options.skip.includes(event.action)) return
       // Calls made inside a code-mode snippet that was just reviewed and allowed are covered by that review.
       if (!event.codeMode && original === "allow" && event.source && reviewedSnippets.has(event.source.id)) return
-      const review = event.codeMode ? options.reviewCode : shouldReview(event.action, original, options, event.resources)
+      let review = event.codeMode ? options.reviewCode : shouldReview(event.action, original, options, event.resources)
       // Code mode can only be refused, never turned into a prompt.
       const policy = event.codeMode ? { ...options, escalation: "deny" as const } : options
       const watch = watchList(options)
@@ -276,6 +301,14 @@ const plugin: Plugin.Plugin = {
         event.effect = effect
         event.message = message
         void log({ ...base, effect, via, message, ms: Date.now() - started, ...extra })
+      }
+
+      // With review paused, the configured rules decide; only the deterministic watched-host gate still applies.
+      const off = review && (await isPaused((await rootOf(event.sessionID as SessionID)).rootID))
+      const pass = () => (off ? decide(original, event.message, "review-off") : undefined)
+      if (off) {
+        review = false
+        if (!gate) return pass()
       }
 
       if (review && options.fastAllow && event.action === "shell" && isReadOnlyShell(event.resources)) {
@@ -301,7 +334,7 @@ const plugin: Plugin.Plugin = {
           )
         : []
       const watched = hosts.filter((host) => isWatched(host, watch))
-      if (!review && !watched.length) return
+      if (!review && !watched.length) return pass()
 
       // An identical command is re-reviewed whenever a script it runs has changed.
       const digest = createHash("sha256").update(JSON.stringify(scripts)).digest("hex").slice(0, 16)
@@ -320,7 +353,7 @@ const plugin: Plugin.Plugin = {
         )
         return decide(outcome.effect, outcome.message, "watched-host", { hosts: unseen })
       }
-      if (!review) return
+      if (!review) return pass()
       // A fetch of a page whose host the user named needs no model call.
       if (event.action === "webfetch" && hostNotes.length && hostNotes.every((note) => note.mentioned && !note.watched))
         return decide("allow", undefined, "user-host", { hosts })
@@ -457,6 +490,32 @@ const plugin: Plugin.Plugin = {
       })
     }
 
+    // /auto-mode [on|off|status]: pause or resume review for this conversation (no argument flips it).
+    await ctx.command.transform((editor) =>
+      editor.add({
+        name: "auto-mode",
+        description: "Pause or resume auto-mode review for this session: on, off or status (no argument toggles)",
+        execute: async ({ sessionID, prompt }) => {
+          const { rootID } = await rootOf(sessionID as SessionID)
+          const request = parseToggle(prompt.text)
+          const before = await isPaused(rootID)
+          if (request === "on" || request === "off" || request === "flip") {
+            const value = request === "flip" ? !before : request === "off"
+            await setPaused(rootID, value)
+            if (value !== before) void log({ sessionID: rootID, toggle: value ? "off" : "on" })
+          }
+          const now = await isPaused(rootID)
+          const text =
+            request === undefined
+              ? `Usage: /auto-mode on | off | status. Review is currently ${now ? "off" : "on"}.`
+              : now
+                ? "Auto-mode review is off for this session: configured permission rules apply without a model review (the watched-host gate still runs). /auto-mode on resumes it."
+                : "Auto-mode review is on for this session."
+          await ctx.session.synthetic({ sessionID, text, resume: false })
+        },
+      }),
+    )
+
     await ctx.permission.hook("evaluate", async (event) => {
       await evaluate(event as unknown as Request & typeof event)
     })
@@ -495,6 +554,7 @@ const plugin: Plugin.Plugin = {
 
     return () => {
       streaks.clear()
+      paused.clear()
       allowed.clear()
       reviewedSnippets.clear()
       refused.clear()
